@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+state
+disabled
+*.pid
+*.log
+backups/

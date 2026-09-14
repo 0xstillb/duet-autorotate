@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Small FydeOS host-side auto-rotation daemon and control command."""
+import argparse
+import fcntl
+import math
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = "/usr/local/duet-autorotate"
+SENSOR = "/sys/bus/iio/devices/iio:device2"
+LOG = os.path.join(ROOT, "duet-autorotate.log")
+PID = os.path.join(ROOT, "duet-autorotate.pid")
+STATE = os.path.join(ROOT, "state")
+DISABLED = os.path.join(ROOT, "disabled")
+CONFIG = os.path.join(ROOT, "config")
+
+ROTATIONS = (0, 90, 180, 270)
+POLL_SEC = 0.15
+STABLE_SEC = 0.70
+GRAVITY_MIN = 7000.0
+GRAVITY_MAX = 14000.0
+AXIS_ENTER = 6500
+AXIS_HOLD = 5600
+DOMINANCE_ENTER = 1.20
+DOMINANCE_HOLD = 1.05
+
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+EV_SYN = 0
+EV_KEY = 1
+SYN_REPORT = 0
+KEY_LEFTCTRL = 29
+KEY_LEFTSHIFT = 42
+KEY_REFRESH = 173
+
+stop_requested = False
+
+
+def log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    line = "%s %s\n" % (timestamp, message)
+    try:
+        with open(LOG, "a", encoding="utf-8") as stream:
+            stream.write(line)
+    except OSError:
+        print(line, end="", file=sys.stderr)
+
+
+def read_int(path):
+    with open(path, encoding="ascii") as stream:
+        return int(stream.read().strip())
+
+
+def read_sensor():
+    return (
+        read_int(os.path.join(SENSOR, "in_accel_x_raw")),
+        read_int(os.path.join(SENSOR, "in_accel_y_raw")),
+        read_int(os.path.join(SENSOR, "in_accel_z_raw")),
+    )
+
+
+def load_config():
+    values = {"poll_sec": POLL_SEC, "stable_sec": STABLE_SEC}
+    try:
+        with open(CONFIG, encoding="ascii") as stream:
+            for raw in stream:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() in values:
+                    values[key.strip()] = float(value.strip())
+    except OSError:
+        pass
+    return values
+
+
+def read_state():
+    try:
+        value = int(open(STATE, encoding="ascii").read().strip())
+        if value in ROTATIONS:
+            return value
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def write_state(value):
+    temporary = STATE + ".tmp"
+    with open(temporary, "w", encoding="ascii") as stream:
+        stream.write("%d\n" % value)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, STATE)
+
+
+def classify(x, y, z, current):
+    """Return target display angle, or None while flat/uncertain.
+
+    The magnitude gate rejects implausible/noisy vectors. The in-plane gate
+    rejects face-up/face-down tablet positions. Dominance ratios provide
+    hysteresis around the 45-degree boundaries.
+    """
+    magnitude = math.sqrt(float(x * x + y * y + z * z))
+    ax, ay = abs(x), abs(y)
+    if magnitude < GRAVITY_MIN or magnitude > GRAVITY_MAX:
+        return None
+
+    if ax >= AXIS_ENTER and ax >= ay * DOMINANCE_ENTER:
+        return 0 if x > 0 else 180
+    if ay >= AXIS_ENTER and ay >= ax * DOMINANCE_ENTER:
+        return 270 if y > 0 else 90
+
+    # Hysteresis: keep the last orientation through a narrow boundary band,
+    # but never keep it when the device is approximately flat.
+    if current in (0, 180) and ax >= AXIS_HOLD and ax >= ay * DOMINANCE_HOLD:
+        return 0 if x > 0 else 180
+    if current in (90, 270) and ay >= AXIS_HOLD and ay >= ax * DOMINANCE_HOLD:
+        return 270 if y > 0 else 90
+    return None
+
+
+class VirtualKeyboard:
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for key in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_REFRESH):
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, key)
+            name = b"duet-autorotate"
+            device = bytearray(1116)
+            device[:len(name)] = name
+            struct.pack_into("@4H I", device, 80, 0x03, 0x1, 0x1, 0x1, 0)
+            os.write(self.fd, device)
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+            time.sleep(0.25)
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def _event(self, typ, code, value):
+        now = time.time()
+        sec = int(now)
+        usec = int((now - sec) * 1000000)
+        os.write(self.fd, struct.pack("@llHHI", sec, usec, typ, code, value))
+
+    def _sync(self):
+        self._event(EV_SYN, SYN_REPORT, 0)
+
+    def press_rotation(self):
+        self._event(EV_KEY, KEY_LEFTCTRL, 1)
+        self._event(EV_KEY, KEY_LEFTSHIFT, 1)
+        self._event(EV_KEY, KEY_REFRESH, 1)
+        self._sync()
+        time.sleep(0.08)
+        self._event(EV_KEY, KEY_REFRESH, 0)
+        self._event(EV_KEY, KEY_LEFTSHIFT, 0)
+        self._event(EV_KEY, KEY_LEFTCTRL, 0)
+        self._sync()
+        time.sleep(0.35)
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+def rotate_to(keyboard, current, target):
+    steps = ((target - current) % 360) // 90
+    for _ in range(steps):
+        keyboard.press_rotation()
+    return target
+
+
+def daemon_main():
+    global stop_requested
+    if os.path.exists(DISABLED):
+        log("disabled flag present; exiting")
+        return 0
+    if os.path.exists(PID):
+        try:
+            old_pid = int(open(PID, encoding="ascii").read().strip())
+            os.kill(old_pid, 0)
+            log("already running pid=%d" % old_pid)
+            return 0
+        except (OSError, ValueError):
+            pass
+
+    os.makedirs(ROOT, exist_ok=True)
+    with open(PID, "w", encoding="ascii") as stream:
+        stream.write("%d\n" % os.getpid())
+    os.chmod(PID, 0o644)
+
+    def request_stop(signum, frame):
+        global stop_requested
+        del signum, frame
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    settings = load_config()
+    poll_sec = max(0.10, min(1.0, settings["poll_sec"]))
+    stable_sec = max(0.50, min(1.50, settings["stable_sec"]))
+    current = read_state()
+    candidate = None
+    candidate_since = None
+    last_report = 0.0
+    keyboard = None
+    try:
+        keyboard = VirtualKeyboard()
+        log("started sensor=%s current=%d poll=%.2fs stable=%.2fs" %
+            (SENSOR, current, poll_sec, stable_sec))
+        while not stop_requested:
+            if os.path.exists(DISABLED):
+                log("disabled flag detected; stopping")
+                break
+            try:
+                x, y, z = read_sensor()
+                new_candidate = classify(x, y, z, current)
+            except (OSError, ValueError) as error:
+                log("sensor error=%s" % error)
+                time.sleep(1.0)
+                continue
+
+            now = time.monotonic()
+            if new_candidate != candidate:
+                candidate = new_candidate
+                candidate_since = now if candidate is not None else None
+                log("x=%d y=%d z=%d candidate=%s stable=0ms" %
+                    (x, y, z, "none" if candidate is None else candidate))
+            elif candidate is not None and candidate_since is not None:
+                stable_ms = int((now - candidate_since) * 1000)
+                if candidate != current and now - candidate_since >= stable_sec:
+                    try:
+                        old = current
+                        current = rotate_to(keyboard, current, candidate)
+                        write_state(current)
+                        log("x=%d y=%d z=%d candidate=%d stable=%dms rotation=%d from=%d" %
+                            (x, y, z, candidate, stable_ms, current, old))
+                        candidate_since = now
+                    except OSError as error:
+                        log("rotation error=%s" % error)
+            if now - last_report >= 30.0:
+                stable_ms = 0 if candidate_since is None else int((now - candidate_since) * 1000)
+                log("x=%d y=%d z=%d candidate=%s stable=%dms rotation=%d" %
+                    (x, y, z, "none" if candidate is None else candidate,
+                     stable_ms, current))
+                last_report = now
+            time.sleep(poll_sec)
+    finally:
+        if keyboard is not None:
+            keyboard.close()
+        try:
+            os.unlink(PID)
+        except FileNotFoundError:
+            pass
+        log("stopped")
+    return 0
+
+
+def initctl(*args):
+    return subprocess.run(["/sbin/initctl"] + list(args), text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
+def control_main(command):
+    if command == "daemon":
+        return daemon_main()
+    if command == "start":
+        if os.path.exists(DISABLED):
+            print("duet-autorotate is disabled")
+            return 1
+        result = initctl("start", "duet-autorotate")
+        print(result.stdout, end="")
+        return result.returncode
+    if command == "stop":
+        result = initctl("stop", "duet-autorotate")
+        print(result.stdout, end="")
+        return 0 if result.returncode in (0, 1) else result.returncode
+    if command == "status":
+        enabled = not os.path.exists(DISABLED)
+        print("enabled=%s" % ("yes" if enabled else "no"))
+        print("tracked_rotation=%d" % read_state())
+        if os.path.exists(PID):
+            print("pid=" + open(PID, encoding="ascii").read().strip())
+        result = initctl("status", "duet-autorotate")
+        print(result.stdout, end="")
+        return 0
+    if command == "disable":
+        os.makedirs(ROOT, exist_ok=True)
+        with open(DISABLED, "w", encoding="ascii") as stream:
+            stream.write("disabled by user\n")
+        os.chmod(DISABLED, 0o600)
+        result = initctl("stop", "duet-autorotate")
+        print("duet-autorotate disabled")
+        print(result.stdout, end="")
+        return 0
+    if command == "enable":
+        try:
+            os.unlink(DISABLED)
+        except FileNotFoundError:
+            pass
+        print("duet-autorotate enabled")
+        return control_main("start")
+    raise SystemExit("unknown command: %s" % command)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="FydeOS Duet auto-rotation")
+    parser.add_argument("command", choices=("daemon", "start", "stop", "status", "enable", "disable"))
+    sys.exit(control_main(parser.parse_args().command))
