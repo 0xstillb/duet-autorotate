@@ -12,6 +12,7 @@ import time
 
 ROOT = "/usr/local/duet-autorotate"
 SENSOR = "/sys/bus/iio/devices/iio:device2"
+KEYBOARD_DEVICE = "/sys/bus/usb/devices/1-3"
 LOG = os.path.join(ROOT, "duet-autorotate.log")
 PID = os.path.join(ROOT, "duet-autorotate.pid")
 STATE = os.path.join(ROOT, "state")
@@ -112,16 +113,16 @@ def classify(x, y, z, current):
         return None
 
     if ax >= AXIS_ENTER and ax >= ay * DOMINANCE_ENTER:
-        return 0 if x > 0 else 180
+        return 90 if x > 0 else 270
     if ay >= AXIS_ENTER and ay >= ax * DOMINANCE_ENTER:
-        return 270 if y > 0 else 90
+        return 0 if y > 0 else 180
 
     # Hysteresis: keep the last orientation through a narrow boundary band,
     # but never keep it when the device is approximately flat.
-    if current in (0, 180) and ax >= AXIS_HOLD and ax >= ay * DOMINANCE_HOLD:
-        return 0 if x > 0 else 180
-    if current in (90, 270) and ay >= AXIS_HOLD and ay >= ax * DOMINANCE_HOLD:
-        return 270 if y > 0 else 90
+    if current in (90, 270) and ax >= AXIS_HOLD and ax >= ay * DOMINANCE_HOLD:
+        return 90 if x > 0 else 270
+    if current in (0, 180) and ay >= AXIS_HOLD and ay >= ax * DOMINANCE_HOLD:
+        return 0 if y > 0 else 180
     return None
 
 
@@ -213,6 +214,7 @@ def daemon_main():
     candidate_since = None
     last_report = 0.0
     keyboard = None
+    keyboard_was_attached = None
     try:
         keyboard = VirtualKeyboard()
         log("started sensor=%s current=%d poll=%.2fs stable=%.2fs" %
@@ -221,6 +223,34 @@ def daemon_main():
             if os.path.exists(DISABLED):
                 log("disabled flag detected; stopping")
                 break
+
+            # Lenovo Duet 5 keyboard cover:
+            # attached  -> PC mode, fixed landscape at 90 degrees
+            # detached  -> tablet mode, use accelerometer auto-rotation
+            keyboard_attached = os.path.exists(KEYBOARD_DEVICE)
+
+            if keyboard_attached != keyboard_was_attached:
+                log("keyboard=%s mode=%s" % (
+                    "attached" if keyboard_attached else "detached",
+                    "pc" if keyboard_attached else "tablet"))
+                keyboard_was_attached = keyboard_attached
+
+            if keyboard_attached:
+                candidate = None
+                candidate_since = None
+
+                if current != 90:
+                    try:
+                        old_rotation = current
+                        current = rotate_to(keyboard, current, 90)
+                        write_state(current)
+                        log("pc mode rotation=90 from=%d" % old_rotation)
+                    except OSError as error:
+                        log("pc mode rotation error=%s" % error)
+
+                time.sleep(poll_sec)
+                continue
+
             try:
                 x, y, z = read_sensor()
                 new_candidate = classify(x, y, z, current)
