@@ -5,3 +5,4 @@ disabled
 *.pid
 *.log
 backups/
+*.tar.gz

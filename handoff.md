@@ -89,3 +89,6 @@ NVMe partitions.
 
 Do not manually use the rotation accelerator while the daemon is enabled.
 Disable it first so the relative tracked angle remains correct.
+
+
+For a fresh real-disk FydeOS installation, follow `REAL-OS-INSTALL.md`; do not rely on Live USB persistence.

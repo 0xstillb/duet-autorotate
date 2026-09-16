@@ -88,3 +88,8 @@ The installer also keeps a reusable copy of the installer, daemon, service
 file, test helper, and documentation at `/usr/local/duet-autorotate/source/`.
 See `README.md` and `handoff.md` there for reboot, OS update, and Live USB
 persistence notes.
+
+
+## Real-disk reinstall
+
+Use `REAL-OS-INSTALL.md` for a normal internal-disk FydeOS installation. The repository is the reusable source of truth; `/tmp` and Live USB sessions are not required.
